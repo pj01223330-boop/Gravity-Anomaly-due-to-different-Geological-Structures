@@ -1,0 +1,1114 @@
+"""
+=============================================================================
+GRAVITY ANOMALY ANALYSIS PIPELINE
+Finite Difference (Explicit)  ↔  Fourier Spectral Methods
+=============================================================================
+
+Theory references:
+  Farquharson & Mosher (2009) — 3-D modelling of gravity data using finite
+      differences. J. Applied Geophysics 68, 417-422.
+  Sandwell (2002) — Laplace's Equation in Cartesian Coordinates and
+      Satellite Altimetry. UCSD Lecture Notes.
+
+Physical problem (free-space upward continuation)
+--------------------------------------------------
+Above all mass (z > 0) the disturbing potential Φ satisfies Laplace's eq.:
+
+        ∂²Φ/∂x² + ∂²Φ/∂z² = 0
+
+Boundary conditions:
+    Φ(x, 0)  = Δg_surface(x)   [Dirichlet — measured gravity at surface]
+    Φ(x, Lz) = 0               [Dirichlet — decay at far field]
+    Φ periodic in x
+
+Analytical (Fourier) solution — Sandwell eq. 12:
+    Φ̂(k, z) = Φ̂(k, 0) · exp(−2π |k| z)
+
+Finite-difference stencil — Farquharson & Mosher §2:
+    Φ[i,j] = w_x·(Φ[i+1,j]+Φ[i-1,j]) + w_z·(Φ[i,j+1]+Φ[i,j-1])
+    w_x = 1/[2(1+α²)],  w_z = α²/[2(1+α²)],  α = Δx/Δz
+
+Iteration methods (all EXPLICIT — zero built-in linear solvers):
+  • "jacobi"       — standard Jacobi (ω=1), always stable
+  • "rb_sor"       — Red-Black SOR, stable for ω∈(0,2), FASTEST  [default]
+  • "gauss_seidel" — cell-by-cell Gauss-Seidel + SOR (mirrors the paper)
+
+Stability note: Plain Jacobi with ω>1 (JOR) is UNSTABLE for the Laplacian
+because the iteration matrix has eigenvalues near -1, and ω>1 maps them
+outside the unit disc.  Red-Black ordering eliminates this issue by
+decoupling the two sub-grids, restoring stability for any ω∈(0,2).
+=============================================================================
+"""
+
+import numpy as np
+#import matplotlib
+#matplotlib.use("Agg")          # non-interactive backend — safe for all OSes
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import os
+#import sys
+import time
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SECTION 1 — TERRAIN GENERATOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TerrainGenerator:
+    """
+    Synthesises geologically motivated 2-D density/topography models.
+
+    generate(choice) → topography [m], density_contrast [kg m⁻³]
+    """
+
+    TERRAIN_TYPES = {
+        "1": "Mid-Ocean Ridge with Transform Fault",
+        "2": "Subduction Zone (Trench + Volcanic Arc)",
+        "3": "Complex Impact Crater with Central Uplift",
+        "4": "Subsurface Salt Dome Clusters (Negative Anomaly)",
+        "5": "Sedimentary Basin",
+        "6": "Continental Rift Valley",
+    }
+
+    def __init__(self, nx=128, ny=128, dx=1000.0, dy=1000.0, seed=42):
+        self.nx, self.ny = nx, ny
+        self.dx, self.dy = dx, dy
+        self._rng = np.random.default_rng(seed)
+        x = np.linspace(-1, 1, nx)
+        y = np.linspace(-1, 1, ny)
+        self.X, self.Y = np.meshgrid(x, y)
+
+    def _fractal_noise(self, alpha=2.0):
+        """1/f^alpha fractal noise (numpy FFT used for terrain generation only)."""
+        raw = self._rng.standard_normal((self.ny, self.nx))
+        rf  = np.fft.fft2(raw)
+        kx  = np.fft.fftfreq(self.nx)
+        ky  = np.fft.fftfreq(self.ny)
+        KX, KY = np.meshgrid(kx, ky)
+        K = np.sqrt(KX**2 + KY**2)
+        K[0, 0] = 1e-10          # avoid division by zero at DC component
+        out = np.real(np.fft.ifft2(rf / K**alpha))
+        lo, hi = out.min(), out.max()
+        return (out - lo) / (hi - lo + 1e-12)
+
+    def generate(self, choice):
+        """
+        Generate topography and density contrast for the requested terrain.
+
+        Parameters
+        ----------
+        choice : str   key from TERRAIN_TYPES
+
+        Returns
+        -------
+        topo : ndarray (ny, nx)   height / thickness in metres
+        rho  : float              density contrast in kg m⁻³
+        """
+        X, Y = self.X, self.Y
+        base = self._fractal_noise()
+
+        if choice == "1":
+            print("  Synthesising Mid-Ocean Ridge with Transform Fault ...")
+            shift = np.where(Y > 0, 0.20, -0.20)
+            ridge = np.exp(-(X - shift)**2 / 0.02)
+            topo  = (base * 500) + (ridge * 2500) - 4000
+            rho   = 1500.0
+
+        elif choice == "2":
+            print("  Synthesising Subduction Zone ...")
+            trench = -np.exp(-(X + 0.2)**2 / 0.01) * 3000
+            arc    =  np.exp(-(X - 0.1)**2 / 0.04) * 4000
+            topo   = (base * 800) + trench + arc - 2000
+            rho    = 1800.0
+
+        elif choice == "3":
+            print("  Synthesising Complex Impact Crater ...")
+            R      = np.sqrt(X**2 + Y**2)
+            peak   =  np.exp(-R**2 / 0.005) * 1500
+            floor_ = -np.exp(-R**2 / 0.050) * 1000
+            rim    = np.sin(R * 15) * np.exp(-R**2 / 0.10) * 800
+            topo   = (base * 300) + peak + floor_ + np.maximum(rim, 0)
+            rho    = 2670.0
+
+        elif choice == "4":
+            print("  Synthesising Subsurface Salt Dome Clusters ...")
+            topo = np.zeros((self.ny, self.nx))
+            for _ in range(8):
+                cx, cy = self._rng.uniform(-0.8, 0.8, 2)
+                w = self._rng.uniform(0.005, 0.02)
+                topo += np.exp(-((X - cx)**2 + (Y - cy)**2) / w) * 2000
+            rho = -500.0          # salt is less dense than surrounding sediment
+
+        elif choice == "5":
+            print("  Synthesising Sedimentary Basin ...")
+            basin = -np.exp(-(X**2 + Y**2) / 0.3) * 3000
+            topo  = (base * 200) + basin
+            rho   = -300.0
+
+        elif choice == "6":
+            print("  Synthesising Continental Rift Valley ...")
+            rift      = -np.exp(-X**2 / 0.005) * 2000
+            shoulders =  np.exp(-(np.abs(X) - 0.2)**2 / 0.01) * 1000
+            topo  = (base * 400) + rift + shoulders
+            rho   = 200.0
+
+        else:
+            raise ValueError(f"Unknown terrain choice: {choice!r}")
+
+        return topo, rho
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SECTION 2 — BOUGUER GRAVITY  (infinite-slab forward model)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_G = 6.67430e-11   # gravitational constant  [m³ kg⁻¹ s⁻²]
+
+
+def bouguer_gravity(topography, rho):
+    """
+    Infinite-slab Bouguer approximation:
+        Δg = 2π G ρ h  [m s⁻²]  ×10⁵  →  mGal
+
+    Parameters
+    ----------
+    topography : ndarray   height / thickness in metres
+    rho        : float     density contrast in kg m⁻³
+
+    Returns
+    -------
+    gravity    : ndarray   Bouguer gravity anomaly in mGal
+    """
+    return 2.0 * np.pi * _G * rho * topography * 1e5
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SECTION 3 — FOURIER SPECTRAL SOLVER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FourierSolver:
+    """
+    Exact solution to Laplace's equation in free space (Sandwell 2002, eq. 12):
+
+        Φ̂(k, z) = Φ̂(k, 0) · exp(−2π|k|z)
+
+    |k| in cycles m⁻¹.  Uses numpy FFT — serves as the reference solution
+    against which all FD results are validated.
+    """
+
+    def __init__(self, dx, dy):
+        self.dx, self.dy = dx, dy
+
+    def upward_continue_2d(self, surface, z):
+        """
+        Full 2-D upward continuation.
+
+        Parameters
+        ----------
+        surface : ndarray (ny, nx)   surface gravity field in mGal
+        z       : float              upward continuation height in metres
+
+        Returns
+        -------
+        ndarray (ny, nx)  continued field
+        """
+        ny, nx = surface.shape
+        kx = np.fft.fftfreq(nx, d=self.dx)
+        ky = np.fft.fftfreq(ny, d=self.dy)
+        KX, KY = np.meshgrid(kx, ky)
+        K = np.sqrt(KX**2 + KY**2)
+        return np.real(np.fft.ifft2(np.fft.fft2(surface) * np.exp(-2 * np.pi * K * z)))
+
+    def upward_continue_1d(self, profile, z):
+        """
+        1-D upward continuation for cross-section comparison with FD.
+
+        Parameters
+        ----------
+        profile : ndarray (nx,)   1-D surface gravity profile in mGal
+        z       : float           upward continuation height in metres
+
+        Returns
+        -------
+        ndarray (nx,)  continued profile
+        """
+        n  = len(profile)
+        kx = np.fft.fftfreq(n, d=self.dx)
+        K  = np.abs(kx)
+        return np.real(np.fft.ifft(np.fft.fft(profile) * np.exp(-2 * np.pi * K * z)))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SECTION 4 — FINITE DIFFERENCE SOLVER  (FULLY EXPLICIT — NO BUILT-INS)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FiniteDifferenceSolver:
+    r"""
+    Iterative solver for Laplace's equation  ∇²Φ = 0  in the (x, z)
+    half-plane.  No scipy, no numpy.linalg — only direct array arithmetic.
+
+    Discretisation (Farquharson & Mosher 2009, §2):
+
+        [Φ(i+1,j) − 2Φ(i,j) + Φ(i−1,j)] / Δx²
+      + [Φ(i,j+1) − 2Φ(i,j) + Φ(i,j−1)] / Δz²  = 0
+
+    Setting α = Δx/Δz and solving for Φ(i,j):
+
+        Φ(i,j) = w_x · (Φ(i+1,j) + Φ(i−1,j))
+                + w_z · (Φ(i,j+1) + Φ(i,j−1))
+
+        w_x = 1 / [2(1 + α²)],   w_z = α² / [2(1 + α²)]
+
+    Boundary conditions:
+        Φ[0,   :] = surface_bc    (Dirichlet — measured data at surface)
+        Φ[nz-1,:] = 0             (Dirichlet — decay at far field)
+        x-direction : periodic
+
+    Available methods (all explicit — no built-in solvers):
+    ----------------------------------------------------------
+    "jacobi"       — Standard Jacobi update (ω forced = 1).
+                     Unconditionally stable.  Slow O(n²) iterations.
+
+    "rb_sor"       — Red-Black Successive Over-Relaxation.  [RECOMMENDED]
+                     Domain partitioned into two interlocking checkerboard
+                     sub-grids.  Odd-parity sites (red) updated first using
+                     only even-parity (black) values, then black sites updated
+                     with the fresh red values.
+                     Stable for any ω ∈ (0, 2).
+                     Optimal ω ≈ 2/(1 + sin(π/n)) ≈ 1.7–1.9 for large n.
+                     Convergence: O(n) iters — roughly n× faster than Jacobi.
+
+    "gauss_seidel" — Cell-by-cell Gauss-Seidel + SOR (mirrors Farquharson &
+                     Mosher 2009 exactly).  Each node immediately uses the
+                     freshest neighbour values.  Stable for ω ∈ (0, 2).
+                     Pedagogically clearest; slower than rb_sor in Python.
+
+    WHY NOT PLAIN JACOBI + ω>1?
+    The Laplacian iteration matrix has eigenvalues in [−1, +1].  Applying
+    ω>1 via JOR maps the eigenvalue near −1 to 1−ω(1−(−1)) = 1−2ω < −1
+    (for ω>1), causing divergence.  Red-Black ordering separates the two
+    sub-grids so each sub-grid's iteration matrix has only non-negative
+    eigenvalues — over-relaxation is then unconditionally stable.
+    """
+
+    def __init__(self, nx, nz, dx, dz,
+                 max_iter=6000, tol=1e-5, omega=1.7, method="rb_sor"):
+        self.nx, self.nz = nx, nz
+        self.dx, self.dz = dx, dz
+        self.max_iter    = max_iter
+        self.tol         = tol
+        self.method      = method
+        # Force omega = 1 for plain Jacobi (SOR is invalid there)
+        self.omega = 1.0 if method == "jacobi" else float(omega)
+
+        alpha     = dx / dz
+        a2        = alpha ** 2
+        self._wx  = 1.0 / (2.0 * (1.0 + a2))
+        self._wz  = a2  / (2.0 * (1.0 + a2))
+
+    # ── initial guess ─────────────────────────────────────────────────────────
+
+    def _initial_guess(self, bc):
+        """
+        Linear interpolation from surface BC down to zero at the far-field BC.
+        Converges significantly faster than initialising from zeros.
+        """
+        z_frac       = np.linspace(0.0, 1.0, self.nz)[:, None]   # (nz, 1)
+        Phi          = bc[None, :] * (1.0 - z_frac)               # broadcast
+        Phi[0,  :]   = bc          # enforce exact Dirichlet at surface
+        Phi[-1, :]   = 0.0         # enforce decay at far field
+        return Phi
+
+    # ── sweep: Jacobi (omega = 1) ─────────────────────────────────────────────
+
+    def _jacobi_sweep(self, Phi):
+        """
+        Standard Jacobi: all interior nodes updated simultaneously from
+        values of the previous sweep.  ω = 1 is mandatory for stability.
+        """
+        wx, wz   = self._wx, self._wz
+        Phi_int  = Phi[1:-1, :]
+        left     = np.roll(Phi_int,  1, axis=1)   # i − 1  (periodic)
+        right    = np.roll(Phi_int, -1, axis=1)   # i + 1  (periodic)
+        above    = Phi[2:,  :]
+        below    = Phi[:-2, :]
+
+        new_int       = wx * (right + left) + wz * (above + below)
+        delta         = new_int - Phi_int
+        Phi[1:-1, :]  = new_int
+        return Phi, float(np.max(np.abs(delta)))
+
+    # ── sweep: Red-Black SOR (recommended) ───────────────────────────────────
+
+    def _rb_sor_sweep(self, Phi):
+        """
+        Red-Black SOR — vectorised, stable for ω ∈ (0, 2).
+
+        Two half-sweeps per iteration:
+          Half 1 — update RED   nodes (i + j even) using BLACK neighbour values.
+          Half 2 — update BLACK nodes (i + j odd)  using the fresh RED values.
+
+        Because red nodes depend only on black nodes (and vice-versa), the
+        checkerboard modes are decoupled and over-relaxation is safe.
+        """
+        wx, wz, omega = self._wx, self._wz, self.omega
+        max_delta     = 0.0
+
+        # Build checkerboard masks for interior rows only
+        ii       = np.arange(self.nx)[None, :]           # shape (1, nx)
+        jj       = np.arange(1, self.nz - 1)[:, None]   # shape (nz-2, 1)
+        red_mask = ((ii + jj) % 2 == 0)                  # shape (nz-2, nx)
+
+        for mask in (red_mask, ~red_mask):   # half-sweep 1 (red), then 2 (black)
+            # Recompute neighbours after each half so black gets fresh red values
+            left  = np.roll(Phi[1:-1, :],  1, axis=1)
+            right = np.roll(Phi[1:-1, :], -1, axis=1)
+            above = Phi[2:,  :]
+            below = Phi[:-2, :]
+
+            rhs           = wx * (right + left) + wz * (above + below)
+            d             = omega * (rhs - Phi[1:-1, :]) * mask
+            Phi[1:-1, :] += d
+            max_delta      = max(max_delta, float(np.max(np.abs(d))))
+
+        return Phi, max_delta
+
+    # ── sweep: Gauss-Seidel scalar loop (mirrors Farquharson & Mosher) ───────
+
+    def _gs_sweep(self, Phi):
+        """
+        Classic Gauss-Seidel + SOR.  Each node updated in-place so its fresh
+        value is immediately used by subsequent nodes — exactly as in the
+        cell-by-cell derivation of Farquharson & Mosher (2009, §2).
+        Stable for ω ∈ (0, 2).  Slowest option due to pure Python loop.
+        """
+        wx, wz, omega = self._wx, self._wz, self.omega
+        nx, nz        = self.nx, self.nz
+        max_delta     = 0.0
+
+        for j in range(1, nz - 1):
+            for i in range(nx):
+                il  = (i - 1) % nx           # periodic left neighbour
+                ir  = (i + 1) % nx           # periodic right neighbour
+                rhs = (wx * (Phi[j, ir] + Phi[j, il])
+                       + wz * (Phi[j + 1, i] + Phi[j - 1, i]))
+                d   = omega * (rhs - Phi[j, i])
+                if abs(d) > max_delta:
+                    max_delta = abs(d)
+                Phi[j, i] += d
+
+        return Phi, max_delta
+
+    # ── public interface ──────────────────────────────────────────────────────
+
+    def solve(self, surface_bc, verbose=True):
+        """
+        Solve Laplace's equation with Dirichlet BC at z = 0.
+
+        Parameters
+        ----------
+        surface_bc : 1-D array, shape (nx,)   boundary condition at surface
+        verbose    : bool   print iteration progress
+
+        Returns
+        -------
+        Phi       : 2-D array (nz, nx)   solution Φ(x, z)
+        residuals : list of float        max|ΔΦ| per iteration
+        """
+        Phi   = self._initial_guess(surface_bc)
+        sweep = {
+            "jacobi":       self._jacobi_sweep,
+            "rb_sor":       self._rb_sor_sweep,
+            "gauss_seidel": self._gs_sweep,
+        }[self.method]
+
+        residuals = []
+        t0        = time.perf_counter()
+        log_ev    = max(1, self.max_iter // 8)
+        delta     = 1e99
+
+        if verbose:
+            m = self.method.replace("_", "-")
+            print(f"    [{m}]  omega={self.omega:.3f}  tol={self.tol:.0e}  "
+                  f"max_iter={self.max_iter}")
+
+        for k in range(self.max_iter):
+            Phi, delta = sweep(Phi)
+            residuals.append(delta)
+
+            if verbose and (k % log_ev == 0 or k < 3):
+                elapsed = time.perf_counter() - t0
+                print(f"      iter {k:5d}  |  max|DPhi| = {delta:.3e}  "
+                      f"[{elapsed:.2f} s]")
+
+            if delta < self.tol:
+                if verbose:
+                    elapsed = time.perf_counter() - t0
+                    print(f"    ✓ Converged: iter={k + 1}  "
+                          f"max|DPhi|={delta:.3e}  [{elapsed:.2f} s]")
+                break
+        else:
+            elapsed = time.perf_counter() - t0
+            if verbose:
+                print(f"    ✗ Warning: max_iter={self.max_iter} reached.  "
+                      f"Final max|DPhi|={delta:.3e}  [{elapsed:.2f} s]")
+
+        return Phi, residuals
+
+    def field_at_altitude(self, Phi, z):
+        """
+        Extract the field at a given height z by linear interpolation
+        between the nearest discrete z-levels.
+
+        Parameters
+        ----------
+        Phi : ndarray (nz, nx)   full FD solution
+        z   : float              target altitude in metres
+
+        Returns
+        -------
+        ndarray (nx,)
+        """
+        jf = z / self.dz
+        j0 = int(jf)
+        j1 = j0 + 1
+        if j1 >= self.nz:
+            return Phi[-1, :].copy()
+        t = jf - j0
+        return (1.0 - t) * Phi[j0, :] + t * Phi[j1, :]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SECTION 5 — COMPARISON RUNNER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_comparison(surface_profile, dx, z_target,
+                   fd_nz=60, fd_tol=1e-5, fd_omega=1.7,
+                   fd_method="rb_sor", fd_max_iter=6000):
+    """
+    Run both solvers on a 1-D surface profile and return a results dict.
+
+    The FD domain spans z ∈ [0, 2·z_target] so the target altitude sits at
+    the mid-point, comfortably away from both boundary conditions.
+
+    Parameters
+    ----------
+    surface_profile : ndarray (nx,)   surface gravity in mGal
+    dx              : float           grid spacing in metres
+    z_target        : float           upward continuation height in metres
+    fd_nz           : int             number of FD vertical levels
+    fd_tol          : float           convergence tolerance
+    fd_omega        : float           SOR relaxation factor
+    fd_method       : str             "jacobi" | "rb_sor" | "gauss_seidel"
+    fd_max_iter     : int             maximum FD iterations
+
+    Returns
+    -------
+    dict with keys: fourier, fd, Phi_full, residuals, rms_err, max_err,
+                    rel_pct, t_fourier, t_fd, method, tol, omega
+    """
+    nx = len(surface_profile)
+    dz = 2.0 * z_target / (fd_nz - 1)
+
+    print(f"\n  FD grid  : nx={nx}, nz={fd_nz}, dx={dx:.0f} m, dz={dz:.1f} m")
+    print(f"  Domain   : Lx={nx * dx / 1e3:.1f} km, Lz={fd_nz * dz / 1e3:.1f} km")
+    print(f"  Target z : {z_target / 1e3:.2f} km")
+
+    # ── Fourier (reference) ────────────────────────────────────────────────
+    t0       = time.perf_counter()
+    fs       = FourierSolver(dx=dx, dy=dx)
+    f_result = fs.upward_continue_1d(surface_profile, z_target)
+    t_fourier = time.perf_counter() - t0
+    print(f"\n  Fourier  →  {t_fourier * 1e3:.2f} ms")
+
+    # ── Finite Difference ─────────────────────────────────────────────────
+    print(f"\n  FD solver ({fd_method}) ...")
+    t0 = time.perf_counter()
+    fd = FiniteDifferenceSolver(
+        nx=nx, nz=fd_nz, dx=dx, dz=dz,
+        max_iter=fd_max_iter, tol=fd_tol,
+        omega=fd_omega, method=fd_method,
+    )
+    Phi, residuals = fd.solve(surface_profile, verbose=True)
+    fd_result      = fd.field_at_altitude(Phi, z_target)
+    t_fd           = time.perf_counter() - t0
+    print(f"  FD       →  {t_fd:.2f} s")
+
+    # ── Error metrics ─────────────────────────────────────────────────────
+    err     = fd_result - f_result
+    rms_err = float(np.sqrt(np.mean(err**2)))
+    max_err = float(np.max(np.abs(err)))
+    sig_sd  = float(np.std(f_result)) + 1e-12
+    rel_pct = rms_err / sig_sd * 100.0
+
+    print("\n  Error (FD vs Fourier):")
+    print(f"    RMS    : {rms_err:.4f} mGal")
+    print(f"    Max    : {max_err:.4f} mGal")
+    print(f"    Rel    : {rel_pct:.2f}% of signal sigma")
+    if t_fourier > 0:
+        print(f"    Speed  : Fourier is {t_fd / t_fourier:.0f}× faster")
+
+    return dict(
+        fourier=f_result, fd=fd_result, Phi_full=Phi,
+        residuals=residuals,
+        rms_err=rms_err, max_err=max_err, rel_pct=rel_pct,
+        t_fourier=t_fourier, t_fd=t_fd,
+        method=fd_method, tol=fd_tol, omega=fd_omega,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SECTION 6 — REAL DATA LOADER  (NetCDF)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_real_netcdf(filepath, var_name=None, z_alt=10_000.0,
+                     fd_method="rb_sor", fd_omega=1.7,
+                     fd_nz=40, fd_tol=1e-4):
+    """
+    Load a gravity / geoid grid from a NetCDF file and run both solvers.
+
+    Free datasets
+    -------------
+      topex.ucsd.edu/WWW_html/mar_grav.html    (marine free-air gravity)
+      icgem.gfz-potsdam.de                     (global spherical harmonic models)
+      ngdc.noaa.gov / ncei.noaa.gov            (NOAA NCEI collections)
+
+    Parameters
+    ----------
+    filepath  : str    path to .nc file
+    var_name  : str    variable to read (None → auto-detect)
+    z_alt     : float  upward continuation altitude in metres
+    fd_method : str    FD solver method
+    fd_omega  : float  SOR relaxation factor
+    fd_nz     : int    FD vertical levels
+    fd_tol    : float  FD convergence tolerance
+
+    Returns
+    -------
+    dict or None
+    """
+    try:
+        import xarray as xr
+    except ImportError:
+        print("  xarray not installed.  Run:  pip install xarray netCDF4")
+        return None
+
+    if not os.path.exists(filepath):
+        print(f"  File not found: {filepath}")
+        return None
+
+    print(f"\n  Loading: {filepath}")
+    ds = xr.open_dataset(filepath)
+    print(f"  Variables   : {list(ds.data_vars)}")
+    print(f"  Coordinates : {list(ds.coords)}")
+
+    # Auto-detect the gravity/geoid variable
+    if var_name is None:
+        for candidate in ["z", "gravity", "geoid", "anomaly",
+                           "freeair", "bouguer", "grav", "h", "topo"]:
+            if candidate in ds.data_vars:
+                var_name = candidate
+                break
+        if var_name is None:
+            var_name = list(ds.data_vars)[0]
+        print(f"  Auto-detected variable: '{var_name}'")
+
+    data = ds[var_name].values.astype(float)
+
+    # Locate longitude / latitude coordinates
+    lon = lat = None
+    for n in ["lon", "longitude", "x"]:
+        if n in ds.coords:
+            lon = ds[n].values
+            break
+    for n in ["lat", "latitude", "y"]:
+        if n in ds.coords:
+            lat = ds[n].values
+            break
+    if lon is None or lat is None:
+        print("  Cannot identify lon/lat coordinates.")
+        return None
+
+    print(f"  Shape  : {data.shape}   "
+          f"range : {np.nanmin(data):.2f} … {np.nanmax(data):.2f}")
+
+    # Replace NaN with field mean for solver BCs
+    nan_mask   = np.isnan(data)
+    data_clean = np.where(nan_mask, np.nanmean(data), data)
+
+    dlat = float(np.abs(np.diff(lat).mean())) if len(lat) > 1 else 0.1
+    dlon = float(np.abs(np.diff(lon).mean())) if len(lon) > 1 else 0.1
+    dy   = dlat * 111_320.0
+    dx   = dlon * 111_320.0 * np.cos(np.radians(float(np.mean(lat))))
+    print(f"  Grid spacing: dx={dx / 1e3:.2f} km, dy={dy / 1e3:.2f} km")
+
+    # Full 2-D Fourier continuation
+    fs      = FourierSolver(dx=dx, dy=dy)
+    fourier = fs.upward_continue_2d(data_clean, z_alt)
+    fourier[nan_mask] = np.nan
+
+    # 1-D FD comparison on the central row
+    mid = data_clean.shape[0] // 2
+    print(f"\n  FD comparison on central profile (row {mid}) ...")
+    comp = run_comparison(
+        data_clean[mid, :], dx=dx, z_target=z_alt,
+        fd_nz=fd_nz, fd_tol=fd_tol, fd_omega=fd_omega, fd_method=fd_method,
+    )
+
+    return dict(
+        lon=lon, lat=lat,
+        surface=data, fourier_2d=fourier,
+        mid_row=mid, comp=comp,
+        dx=dx, dy=dy, z_alt=z_alt,
+        var_name=var_name,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SECTION 7 — PLOTTING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _add_colorbar(fig, ax, im, label):
+    c = fig.colorbar(im, ax=ax, shrink=0.82, pad=0.02)
+    c.set_label(label, fontsize=9)
+
+
+def plot_synthetic(topo, surface_grav, fourier_2d, comp,
+                   terrain_name, z_alt, dx, outpath=None):
+    """
+    Six-panel diagnostic figure for a synthetic terrain run.
+
+    Row 0:  topography | surface gravity | Fourier 2-D upward continued
+    Row 1:  FD vs Fourier profile | FD 2-D field | convergence history
+    """
+    ny, nx = surface_grav.shape
+    extent = [0, nx * dx / 1e3, 0, ny * dx / 1e3]
+    mid    = ny // 2
+    x_km   = np.arange(nx) * dx / 1e3
+
+    fig = plt.figure(figsize=(21, 11))
+    fig.suptitle(
+        f"Gravity Anomaly Pipeline  —  {terrain_name}\n"
+        f"Upward continuation  z = {z_alt / 1e3:.1f} km  |  "
+        f"grid {nx}×{ny},  Δx = {dx / 1e3:.2f} km",
+        fontsize=13, fontweight="bold", y=0.99,
+    )
+    gs = gridspec.GridSpec(
+        2, 3, figure=fig,
+        hspace=0.45, wspace=0.38,
+        left=0.06, right=0.97, top=0.92, bottom=0.07,
+    )
+
+    # Panel 1 — Topography
+    ax = fig.add_subplot(gs[0, 0])
+    im = ax.imshow(topo, origin="lower", cmap="terrain",
+                   extent=extent, aspect="auto")
+    ax.set_title("Geological Structure / Topography", fontsize=10, pad=4)
+    ax.set_xlabel("X (km)", fontsize=9)
+    ax.set_ylabel("Y (km)", fontsize=9)
+    _add_colorbar(fig, ax, im, "Height / Thickness (m)")
+
+    # Panel 2 — Surface gravity
+    ax = fig.add_subplot(gs[0, 1])
+    vmax = np.nanpercentile(np.abs(surface_grav), 99)
+    im = ax.imshow(surface_grav, origin="lower", cmap="seismic",
+                   extent=extent, vmin=-vmax, vmax=vmax, aspect="auto")
+    ax.axhline(mid * dx / 1e3, color="k", lw=1.5, ls="--",
+               label=f"Profile (row {mid})")
+    ax.set_title("Surface Bouguer Gravity  (z = 0)", fontsize=10, pad=4)
+    ax.set_xlabel("X (km)", fontsize=9)
+    ax.set_ylabel("Y (km)", fontsize=9)
+    ax.legend(fontsize=8, loc="upper right")
+    _add_colorbar(fig, ax, im, "mGal")
+
+    # Panel 3 — Fourier 2-D upward continued
+    ax = fig.add_subplot(gs[0, 2])
+    vuc = np.nanpercentile(np.abs(fourier_2d), 99)
+    im = ax.imshow(fourier_2d, origin="lower", cmap="seismic",
+                   extent=extent, vmin=-vuc, vmax=vuc, aspect="auto")
+    ax.set_title(f"Fourier Upward Continued  (z = {z_alt / 1e3:.1f} km)",
+                 fontsize=10, pad=4)
+    ax.set_xlabel("X (km)", fontsize=9)
+    ax.set_ylabel("Y (km)", fontsize=9)
+    _add_colorbar(fig, ax, im, "mGal")
+
+    # Panel 4 — Profile comparison  (spans two columns)
+    ax = fig.add_subplot(gs[1, :2])
+    surf_p = surface_grav[mid, :]
+    ax.plot(x_km, surf_p,
+            color="silver", lw=1.5, zorder=1,
+            label="Surface  (z = 0)")
+    ax.plot(x_km, comp["fourier"],
+            color="#1f77b4", lw=2.2, zorder=3,
+            label=f"Fourier  (z = {z_alt / 1e3:.1f} km)")
+    ax.plot(x_km, comp["fd"],
+            color="#d62728", lw=2.0, ls="--", zorder=4,
+            label=f"FD {comp['method'].replace('_', '-')}  "
+                  f"(z = {z_alt / 1e3:.1f} km)")
+    ax.fill_between(x_km, comp["fourier"], comp["fd"],
+                    color="#2ca02c", alpha=0.25, zorder=2,
+                    label="FD − Fourier  difference")
+    ax.set_title("Central Profile  —  FD vs Fourier Comparison",
+                 fontsize=10, pad=4)
+    ax.set_xlabel("X (km)", fontsize=9)
+    ax.set_ylabel("Gravity Anomaly (mGal)", fontsize=9)
+    ax.legend(fontsize=9, loc="upper right")
+    ax.grid(True, alpha=0.3, lw=0.6)
+
+    stats = (
+        f"RMS error : {comp['rms_err']:.3f} mGal\n"
+        f"Max error : {comp['max_err']:.3f} mGal\n"
+        f"Relative  : {comp['rel_pct']:.2f}%\n"
+        f"Fourier   : {comp['t_fourier'] * 1e3:.1f} ms\n"
+        f"FD        : {comp['t_fd']:.2f} s\n"
+        f"ω = {comp['omega']:.2f},  tol = {comp['tol']:.0e}"
+    )
+    ax.text(0.01, 0.97, stats, transform=ax.transAxes,
+            fontsize=8, va="top", ha="left",
+            bbox=dict(boxstyle="round,pad=0.4",
+                      fc="lightyellow", ec="goldenrod", alpha=0.92))
+
+    # Panel 5 — Convergence history
+    ax = fig.add_subplot(gs[1, 2])
+    iters = np.arange(1, len(comp["residuals"]) + 1)
+    ax.semilogy(iters, comp["residuals"], color="#d62728", lw=1.5)
+    ax.axhline(comp["tol"], color="gray", ls=":", lw=1.2,
+               label=f"tol = {comp['tol']:.0e}")
+    ax.set_title("FD Solver Convergence History", fontsize=10, pad=4)
+    ax.set_xlabel("Iteration", fontsize=9)
+    ax.set_ylabel("max |ΔΦ| (mGal)", fontsize=9)
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3, lw=0.6)
+
+    _save_figure(fig, outpath)
+
+
+def plot_real_data(result, outpath=None):
+    """Four-panel diagnostic figure for real NetCDF data."""
+    lon   = result["lon"]
+    lat   = result["lat"]
+    mid   = result["mid_row"]
+    z_alt = result["z_alt"]
+    dx    = result["dx"]
+    comp  = result["comp"]
+    x_km  = np.arange(len(comp["fourier"])) * dx / 1e3
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    fig.suptitle(
+        f"Real Data  '{result['var_name']}'  |  "
+        f"Upward continuation {z_alt / 1e3:.1f} km",
+        fontsize=13, fontweight="bold",
+    )
+
+    ax = axes[0, 0]
+    vmax = np.nanpercentile(np.abs(result["surface"]), 98)
+    im = ax.pcolormesh(lon, lat, result["surface"],
+                       cmap="seismic", vmin=-vmax, vmax=vmax, shading="auto")
+    ax.axhline(lat[mid], color="k", ls="--", lw=1.5, label="Profile")
+    ax.set_title("Original Surface Gravity  (z = 0)", fontsize=11)
+    ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude")
+    ax.legend(fontsize=9)
+    fig.colorbar(im, ax=ax, label="mGal", shrink=0.85)
+
+    ax = axes[0, 1]
+    vuc = np.nanpercentile(np.abs(result["fourier_2d"]), 98)
+    im2 = ax.pcolormesh(lon, lat, result["fourier_2d"],
+                        cmap="seismic", vmin=-vuc, vmax=vuc, shading="auto")
+    ax.set_title(f"Fourier Upward Continued  ({z_alt / 1e3:.1f} km)", fontsize=11)
+    ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude")
+    fig.colorbar(im2, ax=ax, label="mGal", shrink=0.85)
+
+    ax = axes[1, 0]
+    ax.plot(x_km, result["surface"][mid, :],
+            color="silver", lw=1.5, label="Surface  z = 0")
+    ax.plot(x_km, comp["fourier"],
+            color="#1f77b4", lw=2.2,
+            label=f"Fourier  z = {z_alt / 1e3:.1f} km")
+    ax.plot(x_km, comp["fd"],
+            color="#d62728", lw=2.0, ls="--",
+            label=f"FD {comp['method'].replace('_', '-')}")
+    ax.fill_between(x_km, comp["fourier"], comp["fd"],
+                    color="#2ca02c", alpha=0.25, label="Difference")
+    ax.set_title("Central Profile  —  FD vs Fourier", fontsize=11)
+    ax.set_xlabel("Distance (km)"); ax.set_ylabel("Gravity (mGal)")
+    ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
+
+    ax = axes[1, 1]
+    ax.semilogy(np.arange(1, len(comp["residuals"]) + 1),
+                comp["residuals"], color="#d62728", lw=1.5)
+    ax.axhline(comp["tol"], color="gray", ls=":", lw=1.2,
+               label=f"tol = {comp['tol']:.0e}")
+    ax.set_title("FD Convergence", fontsize=11)
+    ax.set_xlabel("Iteration"); ax.set_ylabel("max|ΔΦ| (mGal)")
+    ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    _save_figure(fig, outpath)
+
+
+def _save_figure(fig, outpath):
+    """Save figure to outpath and display it inline."""
+    os.makedirs(os.path.dirname(outpath) if os.path.dirname(outpath) else ".",
+                exist_ok=True)
+    plt.savefig(outpath, dpi=150, bbox_inches="tight")
+    print(f"\n  Figure saved  →  {outpath}")
+    plt.close(fig)
+
+    # Display inline in Jupyter
+    from IPython.display import display, Image
+    display(Image(filename=outpath))
+    
+    
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SECTION 8 — INPUT HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ask(prompt, default):
+    """Prompt for a string value; return default on empty input."""
+    try:
+        r = input(f"  {prompt} [{default}]: ").strip()
+        return r if r else str(default)
+    except EOFError:
+        return str(default)
+
+
+def _ask_float(prompt, default):
+    """Prompt for a float; return default on empty or invalid input."""
+    try:
+        r = input(f"  {prompt} [{default}]: ").strip()
+        return float(r) if r else float(default)
+    except (ValueError, EOFError):
+        return float(default)
+
+
+def _ask_int(prompt, default):
+    """Prompt for an integer; return default on empty or invalid input."""
+    try:
+        r = input(f"  {prompt} [{default}]: ").strip()
+        return int(r) if r else int(default)
+    except (ValueError, EOFError):
+        return int(default)
+
+
+def _ask_method():
+    """Prompt the user to choose an FD iteration method."""
+    print("\n  FD iteration methods:")
+    print("    [1] rb_sor       — Red-Black SOR         [recommended]")
+    print("    [2] jacobi       — Standard Jacobi (slow, omega fixed=1)")
+    print("    [3] gauss_seidel — Gauss-Seidel + SOR   [slow in Python]")
+    choice = _ask("Method", "1")
+    return {"1": "rb_sor", "2": "jacobi", "3": "gauss_seidel"}.get(choice, "rb_sor")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SECTION 9 — SYNTHETIC MODE
+# ─────────────────────────────────────────────────────────────────────────────
+
+_BANNER = r"""
++============================================================+
+|       GRAVITY ANOMALY ANALYSIS PIPELINE                    |
+|   Finite Difference (Explicit)  <->  Fourier Spectral      |
+|   Farquharson & Mosher (2009) | Sandwell (2002)            |
++============================================================+
+"""
+
+
+def run_synthetic(outdir=r"C:\Users\ripun\Downloads"):
+    """Interactive synthetic-terrain mode."""
+    print("\n" + "-" * 60)
+    print("  SYNTHETIC TERRAIN TYPES")
+    print("-" * 60)
+    for k, v in TerrainGenerator.TERRAIN_TYPES.items():
+        print(f"  [{k}] {v}")
+    print("  [A] All terrains (batch run)")
+    print("-" * 60)
+
+    choice  = _ask("Terrain choice", "1")
+    all_keys = list(TerrainGenerator.TERRAIN_TYPES.keys())
+
+    if choice.upper() == "A":
+        choices = all_keys
+    elif choice in TerrainGenerator.TERRAIN_TYPES:
+        choices = [choice]
+    else:
+        print(f"  Unknown choice '{choice}'.  Defaulting to terrain 1.")
+        choices = ["1"]
+
+    nx      = _ask_int  ("Grid size (nx = ny)", 128)
+    dx      = _ask_float("Grid spacing dx = dy [m]", 1000.0)
+    z_km    = _ask_float("Upward continuation altitude [km]", 5.0)
+    z_alt   = z_km * 1e3
+    meth    = _ask_method()
+    omega   = 1.0 if meth == "jacobi" else _ask_float(
+        "SOR omega (0 < ω < 2, ~1.7–1.9 for large grids)", 1.7)
+    nz      = _ask_int  ("FD vertical levels nz", 60)
+    tol_str = _ask("FD convergence tolerance", "1e-5")
+    try:
+        tol = float(tol_str)
+    except ValueError:
+        tol = 1e-5
+    mxiter  = _ask_int("FD maximum iterations", 6000)
+
+    summary = []
+
+    for tc in choices:
+        if tc not in TerrainGenerator.TERRAIN_TYPES:
+            print(f"  Skipping unknown terrain key '{tc}'")
+            continue
+
+        tname = TerrainGenerator.TERRAIN_TYPES[tc]
+        print(f"\n{'=' * 60}")
+        print(f"  TERRAIN: {tname}")
+        print(f"{'=' * 60}")
+
+        # Generate terrain + surface gravity
+        gen  = TerrainGenerator(nx=nx, ny=nx, dx=dx, dy=dx)
+        topo, rho = gen.generate(tc)
+
+        print("  Computing Bouguer surface gravity ...")
+        surf = bouguer_gravity(topo, rho)
+
+        print("  Fourier 2-D upward continuation ...")
+        fs   = FourierSolver(dx=dx, dy=dx)
+        f2d  = fs.upward_continue_2d(surf, z_alt)
+
+        # 1-D FD comparison on central profile
+        comp = run_comparison(
+            surf[nx // 2, :], dx=dx, z_target=z_alt,
+            fd_nz=nz, fd_tol=tol, fd_omega=omega,
+            fd_method=meth, fd_max_iter=mxiter,
+        )
+
+        tag  = tname[:20].replace(" ", "_")
+        out  = os.path.join(outdir, f"gravity_{tc}_{tag}.png")
+        plot_synthetic(topo, surf, f2d, comp, tname, z_alt, dx, outpath=out)
+
+        summary.append((tname, comp["rms_err"], comp["max_err"],
+                        comp["rel_pct"], comp["t_fd"]))
+
+    # Print summary table for batch runs
+    if len(summary) > 1:
+        print(f"\n{'=' * 70}")
+        print("  BATCH SUMMARY")
+        print(f"  {'Terrain':<40} {'RMS':>8} {'Max':>8} {'Rel%':>7} {'FD(s)':>7}")
+        print(f"  {'-' * 40} {'-' * 8} {'-' * 8} {'-' * 7} {'-' * 7}")
+        for tname, rms, mx, rel, tfd in summary:
+            print(f"  {tname:<40} {rms:8.3f} {mx:8.3f} {rel:7.2f} {tfd:7.2f}")
+        print(f"{'=' * 70}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SECTION 10 — REAL DATA MODE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_real(outdir=r"C:\Users\ripun\Downloads"):
+    """Interactive real-data (NetCDF) mode."""
+    print("\n" + "-" * 60)
+    print("  REAL DATA MODE  (NetCDF .nc files)")
+    print("  Free gravity datasets:")
+    print("    • topex.ucsd.edu/WWW_html/mar_grav.html   (marine free-air)")
+    print("    • icgem.gfz-potsdam.de                    (global models)")
+    print("    • ngdc.noaa.gov / ncei.noaa.gov           (NOAA collections)")
+    print("-" * 60)
+
+    fpath   = _ask("NetCDF file path", "gravity_data.nc")
+    var     = _ask("Variable name   (blank = auto-detect)", "")
+    z_km    = _ask_float("Upward continuation altitude [km]", 10.0)
+    z_alt   = z_km * 1e3
+    meth    = _ask_method()
+    omega   = 1.0 if meth == "jacobi" else _ask_float(
+        "SOR omega", 1.7)
+    fd_nz   = _ask_int("FD vertical levels", 40)
+    tol_str = _ask("FD convergence tolerance", "1e-4")
+    try:
+        tol = float(tol_str)
+    except ValueError:
+        tol = 1e-4
+
+    result = load_real_netcdf(
+        fpath, var_name=var or None, z_alt=z_alt,
+        fd_method=meth, fd_omega=omega, fd_nz=fd_nz, fd_tol=tol,
+    )
+
+    if result is not None:
+        out = os.path.join(outdir, "real_data_analysis.png")
+        plot_real_data(result, outpath=out)
+    else:
+        print("  Data loading failed.  "
+              "Please check the file path and variable name.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SECTION 11 — MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    """
+    Entry point — interactive menu loop.
+
+    Main menu options
+    -----------------
+    [S]  Synthetic terrain  — choose one or all of six geological models,
+         configure the grid and solver parameters, run both solvers and
+         generate multi-panel comparison figures.
+
+    [R]  Real data (NetCDF)  — load a .nc gravity file, apply Fourier
+         upward continuation across the full 2-D grid, then validate a
+         central cross-section against the explicit FD solver.
+
+    [Q]  Quit.
+    """
+    print(_BANNER)
+
+    # Ensure output directory exists
+    outdir = r"C:\Users\PARUL\Downloads"
+    os.makedirs(outdir, exist_ok=True)
+
+    while True:
+        print("\n" + "─" * 50)
+        print("  MAIN MENU")
+        print("─" * 50)
+        print("  [S]  Synthetic terrain   (6 geological models)")
+        print("  [R]  Real data           (NetCDF .nc file)")
+        print("  [Q]  Quit")
+        print("─" * 50)
+
+        try:
+            mode = input("\n  Choice: ").strip().upper()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Interrupted — exiting.")
+            break
+
+        if mode == "Q":
+            print("  Goodbye.")
+            break
+
+        elif mode == "S":
+            try:
+                run_synthetic(outdir=outdir)
+            except KeyboardInterrupt:
+                print("\n  Synthetic run interrupted.")
+            except Exception as exc:
+                print(f"\n  ERROR during synthetic run: {exc}")
+                import traceback
+                traceback.print_exc()
+
+        elif mode == "R":
+            try:
+                run_real(outdir=outdir)
+            except KeyboardInterrupt:
+                print("\n  Real-data run interrupted.")
+            except Exception as exc:
+                print(f"\n  ERROR during real-data run: {exc}")
+                import traceback
+                traceback.print_exc()
+
+        else:
+            print("  Unrecognised option.  Please enter S, R, or Q.")
+
+
+if __name__ == "__main__":
+    main()
